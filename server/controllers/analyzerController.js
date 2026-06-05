@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import Groq from "groq-sdk";
 import { PDFParse } from "pdf-parse";
 import Analysis from "../models/Analysis.js";
 
@@ -48,17 +49,25 @@ const analyzeResume = async (req, res) => {
       });
     }
 
-    if (!process.env.OPENAI_API_KEY) {
+    const openAiKey = process.env.OPENAI_API_KEY;
+    const groqKey = process.env.GROQ_API_KEY;
+    const apiKey = openAiKey || groqKey;
+
+    if (!apiKey) {
       return res.status(500).json({
-        message: "OpenAI API key is missing in server environment variables.",
+        message:
+          "OpenAI or GROQ API key is missing in server environment variables.",
       });
     }
 
-    const openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
+    const useGroq = Boolean(groqKey) && !openAiKey;
+    const client = useGroq
+      ? new Groq({ apiKey: groqKey })
+      : new OpenAI({ apiKey: openAiKey });
 
-const prompt = `
+    const model = useGroq ? "openai/gpt-oss-20b" : "gpt-5.4-mini";
+
+    const prompt = `
 You are a senior ATS (Applicant Tracking System) optimization expert and professional resume reviewer.
 
 Your job is to analyze a resume and compare it against a job description (if provided), producing structured, high-quality, realistic ATS feedback.
@@ -130,8 +139,8 @@ Job Description:
 ${hasJobDescription ? jobDescription.trim() : "Not provided"}
 `;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-5.4-mini",
+    const response = await client.chat.completions.create({
+      model,
       messages: [
         {
           role: "system",
@@ -145,7 +154,12 @@ ${hasJobDescription ? jobDescription.trim() : "Not provided"}
       temperature: 0.7,
     });
 
-    const aiText = response.choices[0].message.content;
+    const aiText =
+      response?.choices?.[0]?.message?.content ||
+      response?.output?.[0]?.content?.[0]?.text ||
+      response?.output?.[0]?.content?.[0]?.content ||
+      response?.output?.[0]?.text ||
+      "";
 
     let parsed;
 
@@ -205,8 +219,13 @@ ${hasJobDescription ? jobDescription.trim() : "Not provided"}
   } catch (error) {
     console.error("AI Error:", error);
 
+    const errorMessage =
+      error?.response?.data?.error?.message ||
+      error?.message ||
+      "Error analyzing resume with AI.";
+
     return res.status(500).json({
-      message: "Error analyzing resume with AI.",
+      message: `AI analysis failed: ${errorMessage}`,
     });
   }
 };
