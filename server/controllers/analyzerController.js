@@ -1,7 +1,8 @@
-import OpenAI from "openai";
 import Groq from "groq-sdk";
 import { PDFParse } from "pdf-parse";
+import crypto from "crypto";
 import Analysis from "../models/Analysis.js";
+import calculateATSScore from "../utils/atsScorer.js";
 
 const analyzeResume = async (req, res) => {
   try {
@@ -49,166 +50,103 @@ const analyzeResume = async (req, res) => {
       });
     }
 
-    const openAiKey = process.env.OPENAI_API_KEY;
+    // Create a content hash to detect duplicate uploads
+    const resumeHash = crypto.createHash("sha256").update(finalResumeText).digest("hex");
+
+    // If we've already analyzed this exact resume, return stored result
+    const existing = await Analysis.findOne({ hash: resumeHash });
+    if (existing) {
+      return res.status(200).json({
+        message: "Resume already analyzed — returning cached result.",
+        analysis: existing.analysisResult,
+        resumeText: existing.resumeText,
+        jobDescription: existing.jobDescription || jobDescription?.trim() || "",
+        resumeLabel: existing.resumeLabel || generatedResumeLabel,
+        jobLabel: existing.jobLabel || generatedJobLabel,
+        originalFileName: existing.originalFileName || originalFileName,
+        cached: true,
+      });
+    }
+
+    // Deterministic ATS scoring (rule-based)
+    const atsResult = calculateATSScore(finalResumeText, jobDescription || "");
+
+    // Use Groq (LLM) only for suggestions, missing skills, and a short summary
     const groqKey = process.env.GROQ_API_KEY;
-    const apiKey = openAiKey || groqKey;
+    let suggestions = [];
+    let missingSkills = atsResult.missingSkills || [];
+    let summary = "";
 
-    if (!apiKey) {
-      return res.status(500).json({
-        message:
-          "OpenAI or GROQ API key is missing in server environment variables.",
-      });
+    if (groqKey) {
+      try {
+        const client = new Groq({ apiKey: groqKey });
+        const model = "openai/gpt-oss-20b";
+
+        const groqPrompt = `You are a professional resume assistant. Return ONLY valid JSON in this EXACT format:\n{\n  "suggestions": [],\n  "missing_skills": [],\n  "summary": ""\n}\n\nResume:\n${finalResumeText}\n\nJob Description:\n${hasJobDescription ? jobDescription.trim() : "Not provided"}\n`;
+
+        const response = await client.chat.completions.create({
+          model,
+          messages: [
+            { role: "system", content: "You are a concise resume assistant." },
+            { role: "user", content: groqPrompt },
+          ],
+          temperature: 0,
+        });
+
+        const aiText =
+          response?.choices?.[0]?.message?.content ||
+          response?.output?.[0]?.content?.[0]?.text ||
+          response?.output?.[0]?.content?.[0]?.content ||
+          response?.output?.[0]?.text ||
+          "";
+
+        try {
+          const cleaned = aiText.replace(/```json/g, "").replace(/```/g, "").trim();
+          const parsed = JSON.parse(cleaned);
+          suggestions = parsed.suggestions || [];
+          // merge groq missing_skills with deterministic missingSkills (dedupe)
+          const groqMissing = parsed.missing_skills || [];
+          missingSkills = Array.from(new Set([...(missingSkills || []), ...groqMissing]));
+          summary = parsed.summary || "";
+        } catch (err) {
+          console.error("Failed to parse Groq suggestions JSON:", err);
+        }
+      } catch (err) {
+        console.error("Groq suggestion error:", err);
+      }
     }
 
-    const useGroq = Boolean(groqKey) && !openAiKey;
-    const client = useGroq
-      ? new Groq({ apiKey: groqKey })
-      : new OpenAI({ apiKey: openAiKey });
-
-    const model = useGroq ? "openai/gpt-oss-20b" : "gpt-5.4-mini";
-
-    const prompt = `
-You are a senior ATS (Applicant Tracking System) optimization expert and professional resume reviewer.
-
-Your job is to analyze a resume and compare it against a job description (if provided), producing structured, high-quality, realistic ATS feedback.
-
-Return ONLY valid JSON in this EXACT format:
-
-{
-  "overallScore": number,
-  "atsMatchScore": number | null,
-  "summary": "2-3 sentence professional evaluation",
-  "strengths": ["point 1", "point 2", "point 3"],
-  "weaknesses": ["point 1", "point 2", "point 3"],
-  "matchedKeywords": ["keyword 1", "keyword 2", "keyword 3"],
-  "missingKeywords": ["keyword 1", "keyword 2", "keyword 3"],
-  "atsSuggestions": ["ATS-specific improvement 1", "ATS-specific improvement 2"],
-  "suggestions": ["general improvement 1", "general improvement 2"]
-}
-
-CRITICAL RULES:
-
-1. overallScore:
-- Score from 1–10
-- Based on structure, clarity, impact, projects, and professionalism
-
-2. atsMatchScore:
-- Score from 1–10
-- Based ONLY on how well the resume matches the job description
-- If NO job description → return null
-
-3. matchedKeywords:
-- Extract important technical keywords FROM THE JOB DESCRIPTION
-- Include ONLY keywords that clearly appear in the resume
-- Examples: "React", "Node.js", "MongoDB", "REST APIs"
-
-4. missingKeywords:
-- Extract important keywords from job description NOT found in resume
-- Do NOT hallucinate keywords
-- Only include realistic, meaningful terms
-
-5. atsSuggestions:
-- Must be SPECIFIC to ATS optimization
-- Focus on:
-  - missing keywords
-  - formatting issues
-  - keyword density
-  - alignment with job description
-
-6. suggestions:
-- General resume improvements
-- Focus on:
-  - impact (metrics, numbers)
-  - clarity
-  - stronger bullet points
-  - better structure
-
-7. STRICT BEHAVIOR:
-- If no job description:
-  - atsMatchScore = null
-  - matchedKeywords = []
-  - missingKeywords = []
-  - atsSuggestions = []
-- DO NOT mix ATS suggestions into general suggestions
-- DO NOT return explanations outside JSON
-
-Resume:
-${finalResumeText}
-
-Job Description:
-${hasJobDescription ? jobDescription.trim() : "Not provided"}
-`;
-
-    const response = await client.chat.completions.create({
-      model,
-      messages: [
-        {
-          role: "system",
-          content: "You are a professional resume analyzer.",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: 0.7,
-    });
-
-    const aiText =
-      response?.choices?.[0]?.message?.content ||
-      response?.output?.[0]?.content?.[0]?.text ||
-      response?.output?.[0]?.content?.[0]?.content ||
-      response?.output?.[0]?.text ||
-      "";
-
-    let parsed;
-
-    try {
-      const cleaned = aiText
-        .replace(/```json/g, "")
-        .replace(/```/g, "")
-        .trim();
-
-      parsed = JSON.parse(cleaned);
-    } catch (parseError) {
-      console.error("JSON parse error from OpenAI response:");
-      console.error(aiText);
-
-      return res.status(500).json({
-        message: "Failed to parse AI response.",
-      });
-    }
-    parsed.matchedKeywords = parsed.matchedKeywords || [];
-    parsed.missingKeywords = parsed.missingKeywords || [];
-    parsed.atsSuggestions = parsed.atsSuggestions || [];
-    parsed.suggestions = parsed.suggestions || [];
-
-    const normalizeScore = (value, allowNull = false) => {
-      if (allowNull && (value === null || value === undefined || value === "")) {
-        return null;
-      }
-
-      const num = Number(value);
-
-      if (Number.isNaN(num)) {
-        return allowNull ? null : 0;
-      }
-
-      if (num > 10 && num <= 100) {
-        return Math.round(num / 10);
-      }
-
-      return Math.max(0, Math.min(10, Math.round(num)));
+    const analysisPayload = {
+      score: atsResult.score,
+      breakdown: atsResult.breakdown,
+      matchedSkills: atsResult.matchedSkills,
+      missingSkills,
+      suggestions,
+      summary,
     };
 
-    parsed.overallScore = normalizeScore(parsed.overallScore);
-    parsed.atsMatchScore = normalizeScore(parsed.atsMatchScore, true);
-
-
+    // Persist analysis for caching and history
+    try {
+      await Analysis.create({
+        user: req.user?.userId || null,
+        resumeText: finalResumeText,
+        jobDescription: jobDescription || "",
+        analysisResult: analysisPayload,
+        resumeLabel: generatedResumeLabel,
+        jobLabel: generatedJobLabel,
+        originalFileName: originalFileName || "",
+        hash: resumeHash,
+        score: atsResult.score,
+        suggestions,
+        missingSkills,
+      });
+    } catch (dbErr) {
+      console.error("Failed to save analysis cache:", dbErr);
+    }
 
     return res.status(200).json({
       message: "Resume analyzed successfully.",
-      analysis: parsed,
+      analysis: analysisPayload,
       resumeText: finalResumeText,
       jobDescription: jobDescription?.trim() || "",
       resumeLabel: generatedResumeLabel,

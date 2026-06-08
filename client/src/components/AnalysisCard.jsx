@@ -12,32 +12,47 @@ function AnalysisCard({ analysis, loading }) {
   if (loading) {
     return (
       <div className="flex min-h-[420px] items-center justify-center rounded-[24px] border border-white/10 bg-white/5 text-sm text-slate-400">
-        Generating analysis...
+        <div className="flex flex-col items-center gap-3">
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-t-transparent border-white/40" />
+          <div>Generating analysis...</div>
+        </div>
       </div>
     );
   }
 
-  const showAtsSection =
-    analysis.atsMatchScore !== null &&
-    analysis.atsMatchScore !== undefined;
+  // Support both old format (overallScore / atsMatchScore) and new format (score, missingSkills)
+  const scorePercent =
+    analysis?.score ??
+    (analysis?.overallScore !== undefined && analysis?.overallScore !== null
+      ? Math.round((Number(analysis.overallScore) / 10) * 100)
+      : null);
+
+  const showAtsSection = scorePercent !== null && scorePercent !== undefined;
 
   return (
     <div className="space-y-6">
       <div className={`grid gap-4 ${showAtsSection ? "md:grid-cols-2" : ""}`}>
         <div className="rounded-[24px] border border-cyan-400/20 bg-cyan-400/10 p-6">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-300">
-            Resume Score
+            ATS Score
           </p>
 
-          <div className="mt-3 flex items-end gap-3">
-            <h3 className="text-5xl font-semibold text-white">
-              {analysis.overallScore}
-            </h3>
-            <span className="pb-2 text-sm text-slate-300">/ 10</span>
+          <div className="mt-3">
+            <div className="flex items-center justify-between">
+              <div className="text-3xl font-semibold text-white">{scorePercent ?? "-"}%</div>
+              <div className="text-sm text-slate-300">(higher is better)</div>
+            </div>
+
+            <div className="mt-3 h-3 w-full overflow-hidden rounded-full bg-white/10">
+              <div
+                className="h-full rounded-full bg-cyan-400"
+                style={{ width: `${scorePercent ?? 0}%` }}
+              />
+            </div>
           </div>
         </div>
 
-        {showAtsSection && (
+        {showAtsSection && analysis?.atsMatchScore !== undefined && (
           <div className="rounded-[24px] border border-purple-400/20 bg-purple-400/10 p-6">
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-purple-300">
               ATS Match Score
@@ -78,13 +93,14 @@ function AnalysisCard({ analysis, loading }) {
         </div>
       )}
 
-      {showAtsSection && analysis.missingKeywords?.length > 0 && (
+      {/* Support new missingSkills field */}
+      {showAtsSection && (analysis.missingSkills || analysis.missingKeywords)?.length > 0 && (
         <div className="rounded-[24px] border border-yellow-400/20 bg-yellow-400/10 p-6">
           <h3 className="mb-3 text-xs font-semibold uppercase tracking-[0.18em] text-yellow-300">
-            Missing Keywords
+            Missing Skills
           </h3>
           <div className="flex flex-wrap gap-2">
-            {analysis.missingKeywords.map((word, index) => (
+            {(analysis.missingSkills || analysis.missingKeywords || []).map((word, index) => (
               <span
                 key={index}
                 className="rounded-full border border-yellow-400/20 bg-yellow-500/20 px-3 py-1 text-sm text-yellow-200"
@@ -110,7 +126,7 @@ function AnalysisCard({ analysis, loading }) {
 
       <AnalysisSection
         title="Actionable Suggestions"
-        items={analysis.suggestions}
+        items={analysis.suggestions || analysis.atsSuggestions || []}
         color="blue"
       />
     </div>
